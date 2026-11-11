@@ -9,7 +9,7 @@ VALUES
     ('1020-PROVIDER-FLOAT:CLUBKONNECT', '1020-CLUBK', 'ClubKonnect Pre-funded Float', 'ASSET', 'NGN', TRUE),
     ('2090-SANDBOX-FUNDING', '2090', 'Sandbox Simulated Funding Liability', 'LIABILITY', 'NGN', TRUE),
     ('3010-ADMIN-CORRECTION', '3010', 'Admin Ledger Correction Account', 'EQUITY', 'NGN', TRUE),
-    ('4010-VTU-COMMISSION', '4010', 'VTU Fulfillment Commission Margin', 'REVENUE', 'NGN', TRUE),
+    ('4010-VTU-COMMISSION', '4010', 'VTU Gross Sales Revenue', 'REVENUE', 'NGN', TRUE),
     ('4020-TRANSACTION-FEES', '4020', 'Platform Convenience Fees', 'REVENUE', 'NGN', TRUE),
     ('5010-VTU-COST-OF-GOODS', '5010', 'Wholesale Cost of VTU Fulfillment', 'EXPENSE', 'NGN', TRUE),
     ('5020-PAYMENT-GATEWAY-FEES', '5020', 'Aggregator Gateway Processing Fees', 'EXPENSE', 'NGN', TRUE),
