@@ -153,11 +153,11 @@ export class WalletService {
 
     const journalEntryId = await LedgerService.postJournalEntry(client, {
       reference,
-      description: `Mock sandbox funding ref: ${reference}`,
+      description: `Mock sandbox funding from simulated cash asset ref: ${reference}`,
       entryType: 'MOCK_SANDBOX_FUNDING',
       metadata: { sandbox: true },
       lines: [
-        { accountId: '2090-SANDBOX-FUNDING', direction: 'DEBIT', amountKobo },
+        { accountId: '1090-SANDBOX-CASH', direction: 'DEBIT', amountKobo },
         { accountId: LedgerService.getUserAvailableAccountId(userId), direction: 'CREDIT', amountKobo },
       ],
     });
