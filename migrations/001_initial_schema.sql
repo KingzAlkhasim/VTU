@@ -47,9 +47,10 @@ DECLARE
   credit_total NUMERIC;
   line_count BIGINT;
 BEGIN
-  target_id := COALESCE(NEW.journal_entry_id, OLD.journal_entry_id);
-  IF target_id IS NULL THEN
+  IF TG_TABLE_NAME = 'journal_entries' THEN
     target_id := COALESCE(NEW.id, OLD.id);
+  ELSE
+    target_id := COALESCE(NEW.journal_entry_id, OLD.journal_entry_id);
   END IF;
 
   SELECT
