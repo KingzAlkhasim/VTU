@@ -4,6 +4,7 @@
 INSERT INTO accounts (id, account_number, name, type, currency, is_active)
 VALUES
     ('1010-GATEWAY-ESCROW', '1010', 'Payment Gateway Settlement Escrow', 'ASSET', 'NGN', TRUE),
+    ('1090-SANDBOX-CASH', '1090', 'Sandbox Simulated Cash Asset', 'ASSET', 'NGN', TRUE),
     ('1020-PROVIDER-FLOAT:MOCK', '1020-MOCK', 'Mock Provider Pre-funded Float', 'ASSET', 'NGN', TRUE),
     ('1020-PROVIDER-FLOAT:VTPASS', '1020-VTPASS', 'VTPass Pre-funded Float', 'ASSET', 'NGN', TRUE),
     ('1020-PROVIDER-FLOAT:CLUBKONNECT', '1020-CLUBK', 'ClubKonnect Pre-funded Float', 'ASSET', 'NGN', TRUE),
