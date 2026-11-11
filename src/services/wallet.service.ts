@@ -1,39 +1,78 @@
+import { config } from '../config.js';
 import { DatabaseClient } from '../db/connection.js';
 import { LedgerService } from './ledger.service.js';
 import { WalletBalance } from '../types/ledger.js';
 
 export class InsufficientFundsError extends Error {
-  constructor(message: string = 'Insufficient available wallet balance.') {
+  constructor(message = 'Insufficient available wallet balance.') {
     super(message);
     this.name = 'InsufficientFundsError';
   }
 }
 
+export class WalletInvariantError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WalletInvariantError';
+  }
+}
+
+type BalanceRow = {
+  user_id: string;
+  available_kobo: string;
+  locked_kobo: string;
+  currency: string;
+  last_journal_entry_id?: string;
+  updated_at: string;
+};
+
+function assertPositiveAmount(amount: bigint, label = 'amount'): void {
+  if (amount <= 0n) throw new WalletInvariantError(`${label} must be greater than zero Kobo.`);
+}
+
+function toBalance(row: BalanceRow): WalletBalance {
+  return {
+    userId: row.user_id,
+    availableKobo: BigInt(row.available_kobo),
+    lockedKobo: BigInt(row.locked_kobo),
+    currency: row.currency,
+    lastJournalEntryId: row.last_journal_entry_id,
+    updatedAt: new Date(row.updated_at),
+  };
+}
+
+async function updateWallet(
+  client: DatabaseClient,
+  userId: string,
+  journalEntryId: string,
+  sql: string,
+  params: unknown[]
+): Promise<WalletBalance> {
+  const result = await client.query<BalanceRow>(sql, [...params, journalEntryId]);
+  const row = result.rows[0];
+  if (!row) throw new WalletInvariantError(`Wallet row for user ${userId} was not found or failed its balance constraint.`);
+  return toBalance(row);
+}
+
 export class WalletService {
-  /**
-   * Initializes wallet accounts for a new user if they don't exist
-   */
+  // Every mutating method in this service MUST be called inside db.transaction().
   static async ensureUserWallet(client: DatabaseClient, userId: string, email: string): Promise<void> {
-    const availAccountId = LedgerService.getUserAvailableAccountId(userId);
-    const lockedAccountId = LedgerService.getUserLockedAccountId(userId);
+    if (!userId.trim()) throw new WalletInvariantError('userId is required.');
 
-    // Create available liability account
     await client.query(
       `INSERT INTO accounts (id, account_number, name, type, currency, user_id)
        VALUES ($1, $2, $3, 'LIABILITY', 'NGN', $4)
        ON CONFLICT (id) DO NOTHING`,
-      [availAccountId, `USER-AVAIL-${userId.slice(0, 8)}`, `User Available Wallet (${email})`, userId]
+      [LedgerService.getUserAvailableAccountId(userId), `USER-AVAIL-${userId.slice(0, 8)}`, `User Available Wallet (${email})`, userId]
     );
 
-    // Create locked liability account
     await client.query(
       `INSERT INTO accounts (id, account_number, name, type, currency, user_id)
        VALUES ($1, $2, $3, 'LIABILITY', 'NGN', $4)
        ON CONFLICT (id) DO NOTHING`,
-      [lockedAccountId, `USER-LOCK-${userId.slice(0, 8)}`, `User Locked Balance (${email})`, userId]
+      [LedgerService.getUserLockedAccountId(userId), `USER-LOCK-${userId.slice(0, 8)}`, `User Locked Balance (${email})`, userId]
     );
 
-    // Initialize balance cache row if not exists
     await client.query(
       `INSERT INTO wallet_balances (user_id, available_kobo, locked_kobo, currency)
        VALUES ($1, 0, 0, 'NGN')
@@ -42,47 +81,24 @@ export class WalletService {
     );
   }
 
-  /**
-   * Retrieves user's wallet balance
-   */
   static async getBalance(client: DatabaseClient, userId: string): Promise<WalletBalance> {
-    const res = await client.query<{
-      user_id: string;
-      available_kobo: string;
-      locked_kobo: string;
-      currency: string;
-      last_journal_entry_id?: string;
-      updated_at: string;
-    }>(
+    const result = await client.query<BalanceRow>(
       `SELECT user_id, available_kobo, locked_kobo, currency, last_journal_entry_id, updated_at
-       FROM wallet_balances
-       WHERE user_id = $1`,
+       FROM wallet_balances WHERE user_id = $1`,
       [userId]
     );
 
-    if (res.rows.length === 0) {
-      return {
-        userId,
-        availableKobo: 0n,
-        lockedKobo: 0n,
-        currency: 'NGN',
-        updatedAt: new Date(),
-      };
+    if (!result.rows[0]) {
+      return { userId, availableKobo: 0n, lockedKobo: 0n, currency: 'NGN', updatedAt: new Date() };
     }
-
-    const row = res.rows[0];
-    return {
-      userId: row.user_id,
-      availableKobo: BigInt(row.available_kobo),
-      lockedKobo: BigInt(row.locked_kobo),
-      currency: row.currency,
-      lastJournalEntryId: row.last_journal_entry_id,
-      updatedAt: new Date(row.updated_at),
-    };
+    return toBalance(result.rows[0]);
   }
 
   /**
-   * Funds user wallet via Gateway Settlement (Production or Staging)
+   * amountKobo is the gross amount charged to the customer.
+   * If the gateway deducts feeKobo before settlement:
+   * DR gateway asset (gross - fee), DR gateway fee expense (fee),
+   * CR customer wallet liability (gross).
    */
   static async creditWalletFromGateway(
     client: DatabaseClient,
@@ -92,21 +108,17 @@ export class WalletService {
     reference: string,
     metadata?: Record<string, unknown>
   ): Promise<{ journalEntryId: string; balance: WalletBalance }> {
-    const userAvailAcc = LedgerService.getUserAvailableAccountId(userId);
-    const netDeposit = amountKobo - feeKobo;
-
-    // Balanced Journal Entry:
-    // DR 1010-GATEWAY-ESCROW (Asset up by gross amount)
-    // CR 2010-USER-AVAILABLE (Liability up by net amount)
-    // CR 4020-TRANSACTION-FEES (Revenue up by fee if any) or DR 5020 for fee
-    const lines = [
-      { accountId: '1010-GATEWAY-ESCROW', direction: 'DEBIT' as const, amountKobo },
-      { accountId: userAvailAcc, direction: 'CREDIT' as const, amountKobo: netDeposit },
-    ];
-
-    if (feeKobo > 0n) {
-      lines.push({ accountId: '5020-PAYMENT-GATEWAY-FEES', direction: 'CREDIT' as const, amountKobo: feeKobo });
+    assertPositiveAmount(amountKobo);
+    if (feeKobo < 0n || feeKobo > amountKobo) {
+      throw new WalletInvariantError('Gateway fee must be between zero and the gross funding amount.');
     }
+
+    const netSettlement = amountKobo - feeKobo;
+    const lines = [
+      ...(netSettlement > 0n ? [{ accountId: '1010-GATEWAY-ESCROW', direction: 'DEBIT' as const, amountKobo: netSettlement }] : []),
+      ...(feeKobo > 0n ? [{ accountId: '5020-PAYMENT-GATEWAY-FEES', direction: 'DEBIT' as const, amountKobo: feeKobo }] : []),
+      { accountId: LedgerService.getUserAvailableAccountId(userId), direction: 'CREDIT' as const, amountKobo },
+    ];
 
     const journalEntryId = await LedgerService.postJournalEntry(client, {
       reference,
@@ -116,148 +128,96 @@ export class WalletService {
       lines,
     });
 
-    // Update wallet balance cache atomically
-    const updRes = await client.query<{
-      user_id: string;
-      available_kobo: string;
-      locked_kobo: string;
-      currency: string;
-      updated_at: string;
-    }>(
+    const balance = await updateWallet(
+      client, userId, journalEntryId,
       `UPDATE wallet_balances
        SET available_kobo = available_kobo + $2,
-           last_journal_entry_id = $3,
-           updated_at = NOW()
+           last_journal_entry_id = $3, updated_at = NOW()
        WHERE user_id = $1
-       RETURNING *`,
-      [userId, netDeposit.toString(), journalEntryId]
+       RETURNING user_id, available_kobo, locked_kobo, currency, last_journal_entry_id, updated_at`,
+      [userId, amountKobo.toString()]
     );
-
-    const row = updRes.rows[0];
-    return {
-      journalEntryId,
-      balance: {
-        userId: row.user_id,
-        availableKobo: BigInt(row.available_kobo),
-        lockedKobo: BigInt(row.locked_kobo),
-        currency: row.currency,
-        updatedAt: new Date(row.updated_at),
-      },
-    };
+    return { journalEntryId, balance };
   }
 
-  /**
-   * Funds user wallet in Sandbox/Test environment only
-   */
   static async mockFundWallet(
     client: DatabaseClient,
     userId: string,
     amountKobo: bigint,
     reference: string
   ): Promise<{ journalEntryId: string; balance: WalletBalance }> {
-    const userAvailAcc = LedgerService.getUserAvailableAccountId(userId);
+    if (config.APP_ENV !== 'sandbox') {
+      throw new Error('SECURITY VIOLATION: Mock wallet funding is permitted only in APP_ENV=sandbox.');
+    }
+    assertPositiveAmount(amountKobo);
 
-    // Balanced Journal:
-    // DR 2090-SANDBOX-FUNDING (Simulated Liability/Equity offset)
-    // CR 2010-USER-AVAILABLE (User available balance up)
     const journalEntryId = await LedgerService.postJournalEntry(client, {
       reference,
-      description: `Mock sandbox funding ref: ${reference}`,
+      description: `Mock sandbox funding from simulated cash asset ref: ${reference}`,
       entryType: 'MOCK_SANDBOX_FUNDING',
       metadata: { sandbox: true },
       lines: [
-        { accountId: '2090-SANDBOX-FUNDING', direction: 'DEBIT', amountKobo },
-        { accountId: userAvailAcc, direction: 'CREDIT', amountKobo },
+        { accountId: '1090-SANDBOX-CASH', direction: 'DEBIT', amountKobo },
+        { accountId: LedgerService.getUserAvailableAccountId(userId), direction: 'CREDIT', amountKobo },
       ],
     });
 
-    const updRes = await client.query<{
-      user_id: string;
-      available_kobo: string;
-      locked_kobo: string;
-      currency: string;
-      updated_at: string;
-    }>(
+    const balance = await updateWallet(
+      client, userId, journalEntryId,
       `UPDATE wallet_balances
        SET available_kobo = available_kobo + $2,
-           last_journal_entry_id = $3,
-           updated_at = NOW()
+           last_journal_entry_id = $3, updated_at = NOW()
        WHERE user_id = $1
-       RETURNING *`,
-      [userId, amountKobo.toString(), journalEntryId]
+       RETURNING user_id, available_kobo, locked_kobo, currency, last_journal_entry_id, updated_at`,
+      [userId, amountKobo.toString()]
     );
-
-    const row = updRes.rows[0];
-    return {
-      journalEntryId,
-      balance: {
-        userId: row.user_id,
-        availableKobo: BigInt(row.available_kobo),
-        lockedKobo: BigInt(row.locked_kobo),
-        currency: row.currency,
-        updatedAt: new Date(row.updated_at),
-      },
-    };
+    return { journalEntryId, balance };
   }
 
-  /**
-   * Locks wallet balance for VTU purchase (DR 2010 Available / CR 2020 Locked)
-   * Enforces Available >= amountKobo atomically with row lock
-   */
   static async holdFundsForPurchase(
     client: DatabaseClient,
     userId: string,
     amountKobo: bigint,
     reference: string
   ): Promise<{ journalEntryId: string }> {
-    // 1. Lock wallet row FOR UPDATE
-    const curRes = await client.query<{ available_kobo: string }>(
-      `SELECT available_kobo FROM wallet_balances WHERE user_id = $1 FOR UPDATE`,
+    assertPositiveAmount(amountKobo);
+    const current = await client.query<{ available_kobo: string }>(
+      'SELECT available_kobo FROM wallet_balances WHERE user_id = $1 FOR UPDATE',
       [userId]
     );
 
-    if (curRes.rows.length === 0 || BigInt(curRes.rows[0].available_kobo) < amountKobo) {
+    if (!current.rows[0] || BigInt(current.rows[0].available_kobo) < amountKobo) {
       throw new InsufficientFundsError(
-        `Insufficient available funds. Required: ${amountKobo} Kobo, Available: ${curRes.rows[0]?.available_kobo ?? 0} Kobo`
+        `Insufficient available funds. Required: ${amountKobo} Kobo; available: ${current.rows[0]?.available_kobo ?? '0'} Kobo.`
       );
     }
 
-    const userAvailAcc = LedgerService.getUserAvailableAccountId(userId);
-    const userLockAcc = LedgerService.getUserLockedAccountId(userId);
-
-    // Balanced Journal:
-    // DR 2010-USER-AVAILABLE: available decreases
-    // CR 2020-USER-LOCKED: locked increases
     const journalEntryId = await LedgerService.postJournalEntry(client, {
       reference: `HOLD:${reference}`,
       description: `Hold funds for purchase ref: ${reference}`,
       entryType: 'VTU_PURCHASE_HOLD',
       lines: [
-        { accountId: userAvailAcc, direction: 'DEBIT', amountKobo },
-        { accountId: userLockAcc, direction: 'CREDIT', amountKobo },
+        { accountId: LedgerService.getUserAvailableAccountId(userId), direction: 'DEBIT', amountKobo },
+        { accountId: LedgerService.getUserLockedAccountId(userId), direction: 'CREDIT', amountKobo },
       ],
     });
 
-    // 2. Update balances
-    await client.query(
+    const updated = await client.query(
       `UPDATE wallet_balances
-       SET available_kobo = available_kobo - $2,
-           locked_kobo = locked_kobo + $2,
-           last_journal_entry_id = $3,
-           updated_at = NOW()
-       WHERE user_id = $1`,
+       SET available_kobo = available_kobo - $2, locked_kobo = locked_kobo + $2,
+           last_journal_entry_id = $3, updated_at = NOW()
+       WHERE user_id = $1 AND available_kobo >= $2`,
       [userId, amountKobo.toString(), journalEntryId]
     );
-
+    if (updated.rowCount !== 1) throw new WalletInvariantError('Wallet changed while holding funds; transaction rolled back.');
     return { journalEntryId };
   }
 
   /**
-   * Settles transaction on fulfillment success:
-   * DR 2020-USER-LOCKED: locked funds cleared
-   * DR 5010-VTU-COST-OF-GOODS: wholesale cost recorded
-   * CR 1020-PROVIDER-FLOAT:<PROVIDER>: provider float balance reduced
-   * CR 4010-VTU-COMMISSION: margin realized
+   * Gross accounting model:
+   * DR customer locked liability / CR VTU sales revenue (gross);
+   * DR cost of goods sold / CR provider float asset (wholesale cost).
+   * Margin is the resulting revenue less COGS; it is not posted a second time.
    */
   static async settlePurchaseSuccess(
     client: DatabaseClient,
@@ -267,48 +227,43 @@ export class WalletService {
     providerName: string,
     reference: string
   ): Promise<{ journalEntryId: string }> {
-    const userLockAcc = LedgerService.getUserLockedAccountId(userId);
-    const providerFloatAcc = LedgerService.getProviderFloatAccountId(providerName);
-    const marginKobo = amountKobo - costKobo;
+    assertPositiveAmount(amountKobo, 'sale amount');
+    if (costKobo < 0n) throw new WalletInvariantError('Provider cost cannot be negative.');
+
+    const current = await client.query<{ locked_kobo: string }>(
+      'SELECT locked_kobo FROM wallet_balances WHERE user_id = $1 FOR UPDATE',
+      [userId]
+    );
+    if (!current.rows[0] || BigInt(current.rows[0].locked_kobo) < amountKobo) {
+      throw new WalletInvariantError('Locked wallet balance is insufficient to settle this purchase.');
+    }
 
     const lines = [
-      { accountId: userLockAcc, direction: 'DEBIT' as const, amountKobo },
-      { accountId: '5010-VTU-COST-OF-GOODS', direction: 'DEBIT' as const, amountKobo: costKobo },
-      { accountId: providerFloatAcc, direction: 'CREDIT' as const, amountKobo: costKobo },
+      { accountId: LedgerService.getUserLockedAccountId(userId), direction: 'DEBIT' as const, amountKobo },
+      { accountId: '4010-VTU-COMMISSION', direction: 'CREDIT' as const, amountKobo },
+      ...(costKobo > 0n ? [
+        { accountId: '5010-VTU-COST-OF-GOODS', direction: 'DEBIT' as const, amountKobo: costKobo },
+        { accountId: LedgerService.getProviderFloatAccountId(providerName), direction: 'CREDIT' as const, amountKobo: costKobo },
+      ] : []),
     ];
-
-    if (marginKobo > 0n) {
-      lines.push({ accountId: '4010-VTU-COMMISSION', direction: 'CREDIT' as const, amountKobo: marginKobo });
-    } else if (marginKobo < 0n) {
-      // Subsidized transaction (margin is negative, cost > amount)
-      lines.push({ accountId: '5030-OPERATIONAL-LOSS', direction: 'DEBIT' as const, amountKobo: -marginKobo });
-    }
 
     const journalEntryId = await LedgerService.postJournalEntry(client, {
       reference: `SETTLE:${reference}`,
-      description: `Settlement for successful VTU ref: ${reference}`,
+      description: `Successful VTU sale and provider cost for ref: ${reference}`,
       entryType: 'VTU_PURCHASE_SETTLE',
       lines,
     });
 
-    // Update balances: clear locked funds
-    await client.query(
+    const updated = await client.query(
       `UPDATE wallet_balances
-       SET locked_kobo = locked_kobo - $2,
-           last_journal_entry_id = $3,
-           updated_at = NOW()
-       WHERE user_id = $1`,
+       SET locked_kobo = locked_kobo - $2, last_journal_entry_id = $3, updated_at = NOW()
+       WHERE user_id = $1 AND locked_kobo >= $2`,
       [userId, amountKobo.toString(), journalEntryId]
     );
-
+    if (updated.rowCount !== 1) throw new WalletInvariantError('Locked wallet balance changed during settlement.');
     return { journalEntryId };
   }
 
-  /**
-   * Releases locked funds back to available on fulfillment failure
-   * DR 2020-USER-LOCKED: locked funds cleared
-   * CR 2010-USER-AVAILABLE: funds returned to user available
-   */
   static async releaseHeldFundsOnFailure(
     client: DatabaseClient,
     userId: string,
@@ -316,8 +271,14 @@ export class WalletService {
     reference: string,
     reason: string
   ): Promise<{ journalEntryId: string }> {
-    const userAvailAcc = LedgerService.getUserAvailableAccountId(userId);
-    const userLockAcc = LedgerService.getUserLockedAccountId(userId);
+    assertPositiveAmount(amountKobo);
+    const current = await client.query<{ locked_kobo: string }>(
+      'SELECT locked_kobo FROM wallet_balances WHERE user_id = $1 FOR UPDATE',
+      [userId]
+    );
+    if (!current.rows[0] || BigInt(current.rows[0].locked_kobo) < amountKobo) {
+      throw new WalletInvariantError('Locked wallet balance is insufficient to release this hold.');
+    }
 
     const journalEntryId = await LedgerService.postJournalEntry(client, {
       reference: `RELEASE:${reference}`,
@@ -325,21 +286,19 @@ export class WalletService {
       entryType: 'VTU_PURCHASE_RELEASE',
       metadata: { reason },
       lines: [
-        { accountId: userLockAcc, direction: 'DEBIT', amountKobo },
-        { accountId: userAvailAcc, direction: 'CREDIT', amountKobo },
+        { accountId: LedgerService.getUserLockedAccountId(userId), direction: 'DEBIT', amountKobo },
+        { accountId: LedgerService.getUserAvailableAccountId(userId), direction: 'CREDIT', amountKobo },
       ],
     });
 
-    await client.query(
+    const updated = await client.query(
       `UPDATE wallet_balances
-       SET locked_kobo = locked_kobo - $2,
-           available_kobo = available_kobo + $2,
-           last_journal_entry_id = $3,
-           updated_at = NOW()
-       WHERE user_id = $1`,
+       SET locked_kobo = locked_kobo - $2, available_kobo = available_kobo + $2,
+           last_journal_entry_id = $3, updated_at = NOW()
+       WHERE user_id = $1 AND locked_kobo >= $2`,
       [userId, amountKobo.toString(), journalEntryId]
     );
-
+    if (updated.rowCount !== 1) throw new WalletInvariantError('Wallet changed while releasing funds.');
     return { journalEntryId };
   }
 }
