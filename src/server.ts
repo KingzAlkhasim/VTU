@@ -15,12 +15,16 @@ app.get('/health/live', (_req, res) => {
   res.status(200).json({ status: 'ok', service: 'kingxtech-vtu-server' });
 });
 
-app.get('/health/ready', async (_req, res) => {
-  const databaseReady = await db.healthCheck();
-  if (!databaseReady) {
-    return res.status(503).json({ status: 'not_ready', checks: { database: false } });
-  }
-  return res.status(200).json({ status: 'ready', checks: { database: true } });
+app.get('/health/ready', (_req, res) => {
+  void db.healthCheck().then((databaseReady) => {
+    if (!databaseReady) {
+      res.status(503).json({ status: 'not_ready', checks: { database: false } });
+      return;
+    }
+    res.status(200).json({ status: 'ready', checks: { database: true } });
+  }).catch(() => {
+    res.status(503).json({ status: 'not_ready', checks: { database: false } });
+  });
 });
 
 app.use((_req, res) => {
