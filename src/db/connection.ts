@@ -3,18 +3,18 @@ import { config } from '../config.js';
 
 const { Pool } = pg;
 
-export interface QueryResult<T = any> {
+export interface QueryResult<T = unknown> {
   rows: T[];
   rowCount: number | null;
 }
 
 export interface DatabaseClient {
-  query<T = any>(text: string, params?: any[]): Promise<QueryResult<T>>;
+  query<T = unknown>(text: string, params?: unknown[]): Promise<QueryResult<T>>;
   release(): void;
 }
 
 export interface DatabasePool {
-  query<T = any>(text: string, params?: any[]): Promise<QueryResult<T>>;
+  query<T = unknown>(text: string, params?: unknown[]): Promise<QueryResult<T>>;
   getClient(): Promise<DatabaseClient>;
   transaction<T>(callback: (client: DatabaseClient) => Promise<T>): Promise<T>;
   end(): Promise<void>;
@@ -22,33 +22,36 @@ export interface DatabasePool {
 }
 
 class PostgresDatabasePool implements DatabasePool {
-  private pool: pg.Pool;
+  private readonly pool: pg.Pool;
 
   constructor(connectionString: string) {
     this.pool = new Pool({
       connectionString,
-      ssl: connectionString.includes('supabase.co') ? { rejectUnauthorized: false } : undefined,
-      max: 20,
+      // Keep certificate verification enabled for hosted PostgreSQL connections.
+      ssl: /supabase\.(co|com)/i.test(connectionString) ? { rejectUnauthorized: true } : undefined,
+      max: 10,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 5000,
+      statement_timeout: 15000,
+      query_timeout: 20000,
     });
 
     this.pool.on('error', (err) => {
-      console.error('CRITICAL: Unexpected error on idle database client', err);
+      console.error('Unexpected error on idle database client', err);
     });
   }
 
-  async query<T = any>(text: string, params?: any[]): Promise<QueryResult<T>> {
+  async query<T = unknown>(text: string, params?: unknown[]): Promise<QueryResult<T>> {
     const res = await this.pool.query(text, params);
-    return { rows: res.rows, rowCount: res.rowCount };
+    return { rows: res.rows as T[], rowCount: res.rowCount };
   }
 
   async getClient(): Promise<DatabaseClient> {
     const client = await this.pool.connect();
     return {
-      query: async <T = any>(text: string, params?: any[]) => {
+      query: async <T = unknown>(text: string, params?: unknown[]) => {
         const res = await client.query(text, params);
-        return { rows: res.rows, rowCount: res.rowCount };
+        return { rows: res.rows as T[], rowCount: res.rowCount };
       },
       release: () => client.release(),
     };
@@ -62,7 +65,11 @@ class PostgresDatabasePool implements DatabasePool {
       await client.query('COMMIT');
       return result;
     } catch (error) {
-      await client.query('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('Database rollback failed; original transaction error follows', rollbackError);
+      }
       throw error;
     } finally {
       client.release();
@@ -71,9 +78,9 @@ class PostgresDatabasePool implements DatabasePool {
 
   async healthCheck(): Promise<boolean> {
     try {
-      const res = await this.pool.query('SELECT 1 as alive');
+      const res = await this.pool.query<{ alive: number }>('SELECT 1 AS alive');
       return res.rows[0]?.alive === 1;
-    } catch (err) {
+    } catch {
       return false;
     }
   }
@@ -83,5 +90,4 @@ class PostgresDatabasePool implements DatabasePool {
   }
 }
 
-// Single instance for production/dev
 export const db: DatabasePool = new PostgresDatabasePool(config.DATABASE_URL);
